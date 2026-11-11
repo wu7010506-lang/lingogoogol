@@ -541,9 +541,8 @@ auto transfer_begin(load_state_t* state, curl_multi_worker_t& multi, curl_easy_t
                 {
                     const auto group="chunk-group:"+file->m_main_id+":"+std::to_string(file->m_chunk_arr.size()/100);
                     const auto key="chunk:"+file->m_main_id+":"+std::to_string(file->m_chunk_cover_progress);
-                    const auto bytes=task->m_bytes_per_content;
-                    const auto size=std::min(file->m_size-file->m_chunk_cover_progress,bytes*100);
-                    const auto count=(size+bytes-1)/bytes;
+                    const auto size=std::min(file->m_size-file->m_chunk_cover_progress,content_size_max_base64*100);
+                    const auto count=(size+content_size_max_base64-1)/content_size_max_base64;
                     allocate=[task,group,key,count]
                     {
                         const auto owner=task_owner(*task,group,100);
@@ -1026,27 +1025,26 @@ auto upload_chunk_transfer_begin
         file->m_chunk_arr.push_back({.m_file=file,.m_id=task_reserve(*file->m_task,key,1,owner,"chunk").front()});
     }
     auto& chunk=file->m_chunk_arr[index];
-    const auto bytes=file->m_task->m_bytes_per_content;
-    std::uint64_t batch_size{ existing ? chunk.m_size : std::min(file->m_size - file->m_chunk_cover_progress, bytes * 100) };
+    std::uint64_t batch_size{ existing ? chunk.m_size : std::min(file->m_size - file->m_chunk_cover_progress, content_size_max_base64 * 100) };
     //Divide and round up.
-    std::uint64_t content_count{ (batch_size + bytes - 1) / bytes };
+    std::uint64_t content_count{ (batch_size + content_size_max_base64 - 1) / content_size_max_base64 };
     if (chunk.m_content_id.empty()) chunk.m_content_id = task_reserve(*file->m_task,"content:"+chunk.m_id,content_count,{},"data");
     file->m_task->m_session->bind(easy,chunk.m_content_id.front());
     chunk.m_size = batch_size;
     google_batch_t batch{ std::move(easy) };
     batch.path_set("/drive/v3");
     std::ifstream stream{ lgo::create_ifstream(file->m_path_local) };
-    stream.seekg(static_cast<std::uint64_t>(index*bytes*100));
+    stream.seekg(static_cast<std::uint64_t>(index*content_size_max_base64*100));
     for (std::uint64_t i{ 0 }; i < content_count; ++i)
     {
         std::uint64_t size{};
         if (i == content_count - 1)
         {
-            size = batch_size - (content_count - 1) * bytes;
+            size = batch_size - (content_count - 1) * content_size_max_base64;
         }
         else
         {
-            size = bytes;
+            size = content_size_max_base64;
         }
         blob_str_opt_t blob
         {
@@ -1068,8 +1066,7 @@ auto upload_chunk_transfer_begin
             throw lgo::error_t{ "The upload source could not be read completely: " + file->m_path_local };
         }
         auto name = nlohmann::json::parse(*blob.m_name);
-        blob.m_content = content_blob_encode(std::move(content), file->m_task->m_content_encoding,
-                                             file->m_task->m_content_zstd, name);
+        blob.m_content = content_blob_encode(std::move(content), file->m_task->m_content_zstd, name);
         blob.m_name = name.dump();
         blob_update(batch, blob);
     }

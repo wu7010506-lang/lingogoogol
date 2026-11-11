@@ -15,31 +15,28 @@
 
 ## 無上限容量的設計
 
-檔案內容預設經過 Base64URL 編碼，也可選擇 cjk14，分散儲存在多個 Google Drive 物件的 `description` 欄位，再透過索引串接與還原。資料夾結構與檔案名稱也由程式管理，因此可以持續新增分塊，擴展儲存規模。
+檔案內容經過 Base64URL 編碼，分散儲存在多個 Google Drive 物件的 `description` 欄位，再透過索引串接與還原。資料夾結構與檔案名稱也由程式管理，因此可以持續新增分塊，擴展儲存規模。
 
 這裡的「無上限」指程式沒有預設的總容量配額；實際可用規模仍受 Google Drive 的物件數量限制、API 配額、請求頻率、帳戶權限與服務政策影響。
 
 這些資料需要透過本程式還原；在 Google Drive 網頁上看到的物件不會是原始檔案的直接副本。請保留其名稱、描述與索引關係。
 
-### 每次 Drive 請求攜帶更多內容
+### 固定切片與片內壓縮
 
-設定表單與 `settings.json` 支援 `content_encoding`（預設 `"base64url"`，可改 `"cjk14"`）與 `content_zstd`（預設 `false`）。只影響新上傳任務；每個任務會在配置 ID 前保存選項，暫停、重啟或改設定後續傳仍使用原切片大小。舊任務沒有選項時沿用 Base64URL、不壓縮。
+設定表單與 `settings.json` 支援 `content_zstd`（預設 `false`）。只影響新上傳任務；每個任務會在配置 ID 前保存壓縮選項，暫停、重啟或改設定後續傳仍使用原選項。所有任務固定以 18,750 bytes 切片；舊任務沒有選項時不壓縮。
 
 | 模式 | 每個完整 content blob 的原始檔案 bytes | description 字元上限 |
 | --- | ---: | ---: |
 | base64url | 18,750 | 25,000 |
-| cjk14 | 43,750（約 2.33 倍） | 25,000 |
-| 任一編碼 + content_zstd | 與該編碼相同 | 壓縮有效時減少 |
-
-cjk14 每字元保存 14 bits，使用 U+4E00–U+8DFF，以大端序將 7 bytes 編成 4 字元。完整 description 是 75,000 UTF-8 bytes；限制按字元計算。其可行性依據使用者提供的 2026-11-10 同 API 實測：25,000 隨機 CJK 字元可精確往返，32,768 ASCII 字元被拒；本次未連線重測。這改善每個 Drive 邏輯請求的容量，不變更 worker、batch 大小、重試、帳戶配置或預備佇列。
+| base64url + content_zstd | 18,750，不擴大切片 | 壓縮有效時減少 |
 
 `content_zstd=true` 在每個固定原始切片內使用 zstd level 3，只有變小才保存壓縮結果。它減少 payload／傳輸 bytes；與 `batch_gzip` 合用後的最終節省依資料而異，**不會進一步減少請求數**。CMake 可選偵測 zstd；缺少時表單停用並忽略新上傳選項，日誌說明原因。下載已有 zstd 資料或續傳曾啟用 zstd 的任務需要支援 zstd 的建置；Windows 發布需附 `libzstd.dll`。
 
-content blob 的 name JSON 使用 `"e":"cjk14"`、`"n":編碼前的精確 bytes`；若壓縮則另存 `"c":"zstd"`、`"r":原始切片 bytes`，此時 n 指壓縮後大小。缺少標記表示舊 Base64URL／未壓縮。下載逐 blob 判斷，不依目前設定；驗證字元、長度、零填補與壓縮框架。新增格式需要新版程式下載，舊版不識別這些標記。
+content blob 的 name JSON 若壓縮則存 `"c":"zstd"`、`"r":原始切片 bytes`。缺少標記表示 Base64URL／未壓縮；description 一律使用 Base64URL。下載逐 blob 判斷，不依目前設定；驗證容量、原始長度與壓縮框架。壓縮格式需要新版程式下載，舊版不識別這些標記。
 
-離線測試：configure 加 `-DLGO_BUILD_CONTENT_TESTS=ON`，build 後執行 `ctest --test-dir <build> -R content-codec --output-on-failure`，確認 PATH 含執行時 DLL。測試涵蓋 0–200 bytes、完整切片、全部 16,384 字元、UTF-8／Unicode escape JSON、舊格式、zstd 標記、無效資料，以及設定／任務紀錄持久化；可加 `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE` 驗證無 zstd 建置。
+離線測試：configure 加 `-DLGO_BUILD_CONTENT_TESTS=ON`，build 後執行 `ctest --test-dir <build> -R content-codec --output-on-failure`，確認 PATH 含執行時 DLL。測試涵蓋 0–200 bytes、18,750 bytes 完整切片、JSON 往返、舊格式、zstd 標記、raw fallback、無效資料，以及設定／任務紀錄持久化；可加 `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE` 驗證無 zstd 建置。
 
-實際使用前請以隨機檔、可壓縮檔、空檔與跨 chunk 大檔，分別測兩種編碼及壓縮開關；上傳、下載後以 `compare.exe` 逐位元組比對。另測中途暫停／重啟並切換設定後續傳，以及舊資料下載；本次沒有接觸 Google 或讀取憑證。
+實際使用前請以隨機檔、可壓縮檔、空檔與跨 chunk 大檔，分別測壓縮關／開；上傳、下載後以 `compare.exe` 逐位元組比對。另測中途暫停／重啟並切換設定後續傳，以及舊資料下載；本次沒有接觸 Google 或讀取憑證。
 
 ## 功能
 

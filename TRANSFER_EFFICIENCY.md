@@ -1,30 +1,27 @@
 # 單一服務帳戶傳輸效率調查
 
-## 2026-11-11：content 容量與片內 zstd
+## 2026-11-11：固定 content 容量與片內 zstd
 
-使用者提供的 2026-11-10 同 Drive API 實測確認 description 限制按 Unicode 字元計算：25,000 隨機 CJK 字元（75,000 UTF-8 bytes）可精確讀回，32,768 ASCII 字元被拒。本次沒有呼叫 Google。針對大量 `403 rateLimitExceeded` 子請求，新增兩個預設關閉的格式選項，沒有新增節流，也沒有變更並行、重試、batch 速率／大小、帳戶／專案配置、Cloud／服務帳戶程式或 blob_queue refill。
+content 一律使用 Base64URL，每片最多 18,750 原始 bytes，完整 description 為 25,000 ASCII chars／UTF-8 bytes。保留預設關閉的 `content_zstd`，只在固定切片內壓縮，不擴大容量。本次沒有呼叫 Google，沒有新增節流，也沒有變更並行、重試、帳戶／專案配置、Cloud／服務帳戶程式或 blob_queue refill。
 
 | 新上傳設定 | 固定原始 bytes / content 邏輯請求 | 完整 description |
 | --- | ---: | --- |
-| `content_encoding="base64url"` | 18,750 | 25,000 ASCII chars / UTF-8 bytes |
-| `content_encoding="cjk14"` | 43,750 | 25,000 chars / 75,000 UTF-8 bytes |
-| 任一編碼 + `content_zstd=true` | 同該編碼，不擴大切片 | 壓縮有利時縮短；否則保存 raw |
+| `content_zstd=false` | 18,750 | 25,000 ASCII chars / UTF-8 bytes |
+| `content_zstd=true` | 18,750，不擴大切片 | 壓縮有利時縮短；否則保存 raw |
 
-cjk14 為連續大端位元流，每 14 bits 加 U+4E00；範圍 U+4E00–U+8DFF，每 7 bytes 恰為 4 字元。尾段補零，name JSON 存 `e=cjk14`、`n=編碼輸入 bytes`，解碼嚴格檢查 UTF-8、字元範圍、最短字元數、精確長度及非零 padding。容量為 `25000*14/8=43750`，是原 Base64URL 的 7/3 倍；相同大檔 content 請求約降至 3/7，另有索引與配置請求，不代表總請求或時間必定改善同樣倍數。
+zstd level 3 在固定切片內壓縮，只有 compressed < raw 才存 `c=zstd` 與 `r=raw bytes`，再以 Base64URL 編碼。原始切片邊界不變，壓縮輸出必定能放入同一 content blob。解壓前限制原始長度，驗證單一完整 frame、無尾隨內容及精確輸出大小。**目前 zstd 只節省 payload／wire bytes，不減少請求；合用 batch gzip 的收益須實測。** 若要利用壓縮減少請求，需新增持久化的逐片 offset／raw-length manifest，先準備可重播的可變切片，並以它取代所有 seek、配置及 checkpoint 算法；這超過此次固定切片設計，未實作。
 
-zstd level 3 在固定切片內壓縮，只有 compressed < raw 才存 `c=zstd` 與 `r=raw bytes`；cjk14 的 n 此時是 compressed bytes。原始切片邊界不變，壓縮輸出必定能放入該編碼。解壓前限制原始長度，驗證單一完整 frame、無尾隨內容及精確輸出大小。**目前 zstd 只節省 payload／wire bytes，不減少請求；合用 batch gzip 的收益須實測。** 若要利用壓縮減少請求，需新增持久化的逐片 offset／raw-length manifest，先準備可重播的可變切片，並以它取代所有 seek、配置及 checkpoint 算法；這超過此次固定切片設計，未實作。
+每個新任務在同一 intent 記錄內保存有效的 `content_zstd`，先落盤才開始準備。上傳預配置、chunk 大小、content 數量及 seekg 都使用既有 `content_size_max_base64=18750` 常數，進度與續傳仍以原始 bytes 計算。舊 journal 無欄位時不壓縮；設定切換不影響既有任務。下載每個 content GET 取 `name,description`，依壓縮標記解碼，不增加 GET 次數；未標記即 Base64URL／未壓縮，帶 `e` 的 blob 明確回報不支援編碼。亂序回應 checkpoint 重播走相同解碼器，舊 description-only 快取仍可讀。目錄複製既有的 name 複製流程會保留壓縮標記。
 
-每個新任務在同一 intent 記錄內保存 `content_encoding` 與有效的 `content_zstd`，先落盤才開始準備。上傳預配置、chunk 大小、content 數量及 seekg 都取自任務 `m_bytes_per_content`，進度仍以原始 bytes 累加。舊 journal 無欄位時固定 Base64URL、不壓縮；設定切換不影響既有任務。下載改成每個 content GET 取 `name,description`，依 blob 標記解碼，不增加 GET 次數；亂序回應 checkpoint 重播走相同解碼器，舊 description-only 快取仍可讀。目錄複製既有的 name 複製流程會保留新標記。
+batch PATCH 與逐筆 PATCH 都明確使用 `application/json; charset=UTF-8`；curl body 與 Content-Length 沿用 bytes。content 的 Base64URL payload 檢查上限為 25,000 bytes；上層 folder／chunk JSON 索引維持既有保守大小檢查。
 
-nlohmann 預設 dump 保留 UTF-8，不做 `ensure_ascii=true`，所以 cjk14 在 request body 中保持三 bytes／字元。batch PATCH 與逐筆 PATCH 都明確使用 `application/json; charset=UTF-8`；curl body 與 Content-Length 沿用 bytes。新增 payload 檢查以 cjk14 UTF-8 bytes / 3 計算字元，上層 folder／chunk JSON 索引不經 cjk14，維持既有保守大小檢查。下載 JSON parser 也接受伺服器回傳的 Unicode escape。
+設定表單沿用文字驗證／checkbox／取消／背景套用；預設 `content_zstd=false`。移除編碼欄位後，`batch_request`／`batch_gzip`／`content_zstd` 對應 `values[8]`／`values[9]`／`values[10]`。CMake 可選 `find_package(zstd QUIET CONFIG)`，找不到可正常建置；GUI 停用壓縮選項，手動 true 對新任務無效並寫日誌。已有 zstd 的下載或任務續傳會明確報需要支援 zstd 的建置。MSYS2 `E:/msys64/clang64` 已有開發標頭，未執行 pacman；將 zstd 公開標頭複製到建置目錄並僅繼承套件的連結相依，避免其 CRT 標頭干擾 LLVM-MinGW。可用 `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE` 測停用路徑，發布須附 libzstd.dll。
 
-設定表單沿用文字驗證／checkbox／取消／背景套用；預設 `content_encoding="base64url"`、`content_zstd=false`。CMake 可選 `find_package(zstd QUIET CONFIG)`，找不到可正常建置；GUI 停用壓縮選項，手動 true 對新任務無效並寫日誌。已有 zstd 的下載或任務續傳會明確報需要支援 zstd 的建置。MSYS2 `E:/msys64/clang64` 已有開發標頭，未執行 pacman；將 zstd 公開標頭複製到建置目錄並僅繼承套件的連結相依，避免其 CRT 標頭干擾 LLVM-MinGW。可用 `-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE` 測停用路徑，發布須附 libzstd.dll。
+離線測試 target：`-DLGO_BUILD_CONTENT_TESTS=ON`，執行 `ctest --test-dir <build> -R content-codec --output-on-failure`；使用實際 storage.encode／storage.state 模組。涵蓋 0–200 bytes、18,750 bytes 滿容量的隨機／重複資料、JSON 往返、舊格式、zstd 標記與 raw fallback，及超量切片、不支援編碼、非法長度、截斷／損壞／尾隨壓縮資料。另在全新隔離目錄測試設定落盤／重讀、任務紀錄重啟還原及切換設定後仍保留原壓縮選項。
 
-離線測試 target：`-DLGO_BUILD_CONTENT_TESTS=ON`，執行 `ctest --test-dir <build> -R content-codec --output-on-failure`；使用實際 storage.encode／storage.state 模組。涵蓋 0–200 bytes、滿容量的隨機／重複資料、全部 16,384 字元、大端序向量、UTF-8／escaped JSON、舊格式、zstd 標記與 raw fallback，及非法字元、padding、長度、壓縮資料。另在全新隔離目錄測試設定落盤／重讀、任務紀錄重啟還原及切換設定後仍保留原格式。
+本機驗證：移除編碼選項後，指定 `rebuild.ps1` 完整成功，已安裝至 `E:/lingogoogol-runtime/bin/storage.exe` 並打包 29 個 DLL。有 zstd 的 codec 測試通過（CTest 1/1），`git diff --check` 通過。首次 install 遇到既有執行中的程序（PID 43808）鎖住執行檔，將舊檔改名保留為同目錄的 `storage.running-43808.exe` 後重新執行即成功；既有程序持續執行，沒有啟動新版程式。本次未重測無 zstd 建置。
 
-本機驗證：有／無 zstd 皆完成整個程式的編譯與連結，codec 測試皆通過；補充持久化案例後，有 zstd 的完整測試亦通過（CTest 1/1）。`git diff --check` 通過。指定 `rebuild.ps1` 最終完整成功，已安裝至 `E:/lingogoogol-runtime/bin/storage.exe` 並打包 29 個 DLL。首次 install 遇到既有執行中的程序（PID 20380）鎖住執行檔，將舊檔改名保留為同目錄的 `storage.running-20380.exe` 後重新執行即成功；既有程序持續執行，沒有中斷傳輸或啟動新版程式。
-
-實際驗收仍需兩種編碼 × 壓縮開關，上傳→下載→`compare.exe` 逐位元組比較，涵蓋空檔、最後不足片、跨 100-content chunk 的檔案、暫停／重啟及設定切換續傳。尤其確認 Drive 確實保留整個 cjk14 字元範圍、name 標記及 UTF-8 description；本次無 Google／憑證操作。
+實際驗收仍需壓縮關／開，上傳→下載→`compare.exe` 逐位元組比較，涵蓋空檔、最後不足片、跨 100-content chunk 的檔案、暫停／重啟及設定切換續傳，確認 name 壓縮標記與內容完整；本次無 Google／憑證操作。
 
 分支：`perf-transfer`；原始調查基準：`c0144333191d50b3be63aa96473bbcdc56b193e1`。本次加入可選的 batch gzip 與前景 batch 大小；預設 `batch_gzip=false`、`batch_size=100`。沒有修改 Cloud／帳戶／金鑰／OAuth 管理、跨帳戶配置與路由、背景佇列補充數量、worker 名額、重試上限或派送節流。
 
@@ -78,7 +75,7 @@ curl 內部能處理 gzip 回應，不代表程式可直接呼叫其內部 zlib�
 | 準備檔案大小 | `file_download()`：main file 的 `GET fields=name` | 1 | 1 |
 | file 索引 | `download_file_load_begin()`：依 `next` 逐頁 `GET fields=name,description`，包含再讀一次 main file | P | P |
 | chunk 索引 | `download_chunk_load_begin()`：每批最多 100 個 `GET fields=name,description` | B | N |
-| content 資料 | `download_chunk_transfer_begin()`：每個 chunk 一批，含其全部 `GET fields=description` | N | C |
+| content 資料 | `download_chunk_transfer_begin()`：每個 chunk 一批，含其全部 `GET fields=name,description` | N | C |
 
 因此 batch 開啟時是 **`1 + P + B + N` 個 HTTP 請求**；關閉時是 **`1 + P + N + C` 個 HTTP 請求**。兩者邏輯 GET 數量相同。相關實作位於 [storage/kernel/load/.cpp](storage/kernel/load/.cpp)；逐筆模式的拆分位於 [request.cpp](storage/kernel/load/request.cpp)。
 

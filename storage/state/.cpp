@@ -198,12 +198,6 @@ auto storage_settings_t::parse_batch_size(std::string_view text) -> std::size_t
     return count;
 }
 
-auto storage_settings_t::validate_content_encoding(std::string_view encoding) -> void
-{
-    if (encoding != "base64url" && encoding != "cjk14")
-        throw std::runtime_error{"content_encoding 必須是 base64url 或 cjk14"};
-}
-
 auto storage_settings_t::load() -> storage_settings_t
 {
     storage_settings_t result;
@@ -222,8 +216,6 @@ auto storage_settings_t::load() -> storage_settings_t
     parse_http_log_codes(result.http_log_codes);
     result.batch_request = data.value("batch_request", true);
     result.batch_gzip = data.value("batch_gzip", false);
-    result.content_encoding = data.value("content_encoding", std::string{"base64url"});
-    validate_content_encoding(result.content_encoding);
     result.content_zstd = data.value("content_zstd", false);
     // Parse the JSON representation as an integer too: typed JSON conversion
     // to size_t would silently wrap negative values and truncate decimals.
@@ -236,7 +228,6 @@ auto storage_settings_t::load() -> storage_settings_t
 }
 auto storage_settings_t::save() const -> void
 {
-    validate_content_encoding(content_encoding);
     parse_http_log_codes(http_log_codes);
     if (!worker_count) throw std::runtime_error{"worker 數量必須大於零"};
     if (batch_size<1 || batch_size>100) throw std::runtime_error{"batch_size 必須是 1 到 100 的整數"};
@@ -248,7 +239,6 @@ auto storage_settings_t::save() const -> void
                                                          {"network_retries", network_retries},
                                                          {"batch_request", batch_request},
                                                          {"batch_gzip", batch_gzip},
-                                                         {"content_encoding", content_encoding},
                                                          {"content_zstd", content_zstd},
                                                          {"batch_size", batch_size},
                                                          {"worker_count", worker_count}};
